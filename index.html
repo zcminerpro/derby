@@ -663,6 +663,7 @@ const CONFIG = {
   X_URL: "https://x.com/usederby",
   SITE_URL: "",            // e.g. ponsderby.xyz; empty uses the address the page is served from
   RPC: "https://rpc.mainnet.chain.robinhood.com",
+  MULTICALL: "0xcA11bde05977b3631167028862bE2a173976CA11", // Multicall3: many contract reads in one request
   EXPLORER: "https://robinhoodchain.blockscout.com",
   PONS: "https://ponsfamily.com/launchpad/",
   FACTORY: "0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e",
@@ -924,7 +925,7 @@ async function rpcOnce(method, params, timeout){
   try{
     const r = await fetch(CONFIG.RPC,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({jsonrpc:"2.0",id:1,method,params}),signal:ac.signal});
     const j = await r.json();
-    if (j.error){ const e = new Error(j.error.message); e.rpc = !/rate|limit|busy|timeout|429/i.test(j.error.message||""); throw e; }
+    if (j.error){ const e = new Error(j.error.message); e.rpc = j.error.code !== 429 && !/rate|limit|busy|timeout|too many|429/i.test(j.error.message||""); throw e; }
     return j.result;
   } finally { clearTimeout(to); }
 }
@@ -934,18 +935,12 @@ async function rpc(method, params, timeout=8000, tries=4){
     catch(e){ if (e.rpc || k >= tries-1) throw e; await sleep(700 * 2**k + Math.random()*300); }
   }
 }
-async function rpcBatch(calls){
-  for (let k=0;k<3;k++){ try { return await rpcBatchOnce(calls); } catch(e){ if (k===2) throw e; await sleep(800 * 2**k); } }
-}
-async function rpcBatchOnce(calls){
-  const r = await fetch(CONFIG.RPC,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(calls.map((c,i)=>({jsonrpc:"2.0",id:i,method:c[0],params:c[1]}))), signal:AbortSignal.timeout(10000)});
-  const j = await r.json(); const out=[]; (Array.isArray(j)?j:[]).forEach(x=>out[x.id]=x.result); return out;
-}
 const hex = n => "0x"+n.toString(16);
 const word = (d,k) => BigInt("0x"+d.slice(2+64*k, 2+64*k+64));
 const topicAddr = t => ("0x"+t.slice(26)).toLowerCase();
 const padTopic = a => "0x"+"0".repeat(24)+a.toLowerCase().replace("0x","");
-function decodeStr(h){ try{ if(!h||h.length<130) return ""; const len=parseInt(h.slice(66,130),16); return decodeURIComponent(h.slice(130,130+len*2).replace(/(..)/g,"%$1")); }catch(e){ return ""; } }
+function decodeStr(h){ try{ if(h && h.length===66) return decodeURIComponent(h.slice(2).replace(/(00)+$/,"").replace(/(..)/g,"%$1"));
+  if(!h||h.length<130) return ""; const len=parseInt(h.slice(66,130),16); return decodeURIComponent(h.slice(130,130+len*2).replace(/(..)/g,"%$1")); }catch(e){ return ""; } }
 
 const L = { head:0, headTs:0, rate:0.1028, polling:false, extra:new Set(), queue:Promise.resolve() };
 // one reader of new blocks at a time, so no trade is applied twice or skipped
@@ -993,17 +988,21 @@ async function getLogsChunked(from, to, filter, step=CONFIG.LOG_SPAN){
   }
   return out;
 }
-function shipFromLaunchLog(l){
+function shipFromLaunchLog(l, known){
   const curve = topicAddr(l.topics[2]);
   if (S.byCurve.has(curve)) return null;
   const info = launchInfo(l);
-  return addShip({sym:"…", name:"", token:topicAddr(l.topics[1]), curve, dev:topicAddr(l.topics[3]), t0:blockT(parseInt(l.blockNumber,16)),
+  return addShip({sym:known?.sym || "…", name:known?.name || "", token:topicAddr(l.topics[1]), curve, dev:topicAddr(l.topics[3]), t0:blockT(parseInt(l.blockNumber,16)),
     pair: info, grad: info.isEth ? (Number(info.thr)/1e18 || CONFIG.GRAD) : CONFIG.GRAD});
 }
 async function ingest(from, to){
   const launches = await getLogsChunked(from, to, {address:CONFIG.FACTORY, topics:[CONFIG.T_LAUNCH]});
-  const fresh = launches.map(shipFromLaunchLog).filter(Boolean);
-  const unnamed = S.ships.filter(s => s && s.sym==="…"); // includes any the RPC failed to name earlier
+  // ask for the names first, so that a horse comes onto the course already named; never wait long for them
+  const unknown = launches.filter(l => !S.byCurve.has(topicAddr(l.topics[2]))).map(l => topicAddr(l.topics[1]));
+  const names = unknown.length ? await Promise.race([readNames(unknown).catch(()=>null), sleep(2500).then(()=>null)]) : null;
+  launches.forEach(l => shipFromLaunchLog(l, names?.get(topicAddr(l.topics[1]))));
+  // the rest: any the network failed to name, and the symbols of unusual pair tokens
+  const unnamed = S.ships.filter(s => s && (s.sym==="…" || (s.pair && !s.pair.isEth && !s.pair.sym)));
   if (unnamed.length) nameShips(unnamed);
   const active = S.ships.filter(s => s.state!=="wreck" || S.t - (s.wreckAt||0) < 1800 || L.extra.has(s.curve)).map(s=>s.curve);
   let trades = [];
@@ -1045,26 +1044,49 @@ function relabel(s){
     l.html = l.html.split("<b>…</b>").join(`<b>${esc(s.sym)}</b>`);
     if (l.kind==="launch" && s.name) l.html += ` · ${esc(s.name)}`; }
 }
+// read many contracts with a single request: the public RPC counts every call in a batch against its limit
+async function multicall(calls){ // [[address, 4-byte selector]] -> [answer or null]
+  const w = n => n.toString(16).padStart(64,"0");
+  const data = "0x82ad56cb" + w(32) + w(calls.length) + calls.map((c,i)=>w(calls.length*32 + i*160)).join("")
+    + calls.map(([to,sel]) => to.slice(2).toLowerCase().padStart(64,"0") + w(1) + w(96) + w(4) + sel.slice(2).padEnd(64,"0")).join("");
+  const h = String(await rpc("eth_call",[{to:CONFIG.MULTICALL, data},"latest"])).slice(2);
+  const at = byte => parseInt(h.slice(byte*2, byte*2+64), 16);
+  const list = at(0), base = list + 32;
+  if (at(list) !== calls.length) throw new Error("unexpected multicall answer");
+  return calls.map((_,i) => { const el = base + at(base + i*32); if (!at(el)) return null;
+    const b = el + at(el+32); return "0x" + h.slice((b+32)*2, (b+32+at(b))*2); });
+}
+async function readSymbols(tokens){
+  const out = [];
+  for (let i=0;i<tokens.length;i+=100){
+    const part = tokens.slice(i,i+100);
+    const res = await multicall(part.flatMap(t => [[t,"0x06fdde03"],[t,"0x95d89b41"]]));
+    part.forEach((t,k) => out.push({name:cleanStr(decodeStr(res[2*k]), 64), sym:cleanStr(decodeStr(res[2*k+1]), 24)}));
+  }
+  return out;
+}
+async function readNames(tokens){
+  const res = await readSymbols(tokens), out = new Map();
+  tokens.forEach((t,k) => { if (res[k].sym) out.set(t, res[k]); });
+  return out;
+}
 async function nameShips(list){
   list = list.filter(s => !s.naming && (s.nameTries||0) < 3);
+  if (!list.length) return;
   list.forEach(s => s.naming = true);
-  for (let i=0;i<list.length;i+=10){
-    const part = list.slice(i,i+10);
-    try{
-      const res = await rpcBatch(part.flatMap(s=>[["eth_call",[{to:s.token,data:"0x06fdde03"},"latest"]],["eth_call",[{to:s.token,data:"0x95d89b41"},"latest"]]]));
-      part.forEach((s,k)=>{
-        s.nameTries = (s.nameTries||0) + 1;
-        if (res[2*k+1] === undefined && s.nameTries < 3) return; // no answer for this one: ask again on a later poll
-        s.name = cleanStr(decodeStr(res[2*k]), 64); s.sym = cleanStr(decodeStr(res[2*k+1]), 24) || short(s.token); relabel(s); checkCopycat(s); });
-      const others = part.filter(s => s.pair && !s.pair.isEth && !s.pair.sym);
-      if (others.length){
-        const r2 = await rpcBatch(others.map(s=>["eth_call",[{to:s.pair.pair,data:"0x95d89b41"},"latest"]]));
-        others.forEach((s,k)=>{ s.pair.sym = cleanStr(decodeStr(r2[k]), 24) || short(s.pair.pair); });
-      }
-      logDirty = true;
-    }catch(e){}
-    part.forEach(s => s.naming = false);
-  }
+  try{
+    const nameless = list.filter(s => s.sym==="…");
+    const pairs = [...new Set(list.filter(s => s.pair && !s.pair.isEth && !s.pair.sym).map(s => s.pair.pair))];
+    const res = await readSymbols([...nameless.map(s=>s.token), ...pairs]);
+    list.forEach(s => s.nameTries = (s.nameTries||0) + 1); // only answered requests count, a silent network is asked again
+    nameless.forEach((s,k) => {
+      if (!res[k].sym && s.nameTries < 3) return;
+      // a token with no readable symbol goes by its name, or by the start of its address
+      s.name = res[k].name; s.sym = res[k].sym || cleanStr(res[k].name, 24) || "#" + s.token.slice(2,6).toUpperCase(); relabel(s); checkCopycat(s); });
+    pairs.forEach((a,k) => { const sym = res[nameless.length+k].sym || short(a); list.forEach(s => { if (s.pair?.pair===a) s.pair.sym = sym; }); });
+    logDirty = true;
+  }catch(e){}
+  list.forEach(s => s.naming = false);
 }
 async function poll(){
   if (L.polling) return; L.polling = true;
