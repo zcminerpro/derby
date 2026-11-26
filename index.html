@@ -695,8 +695,10 @@ const CONFIG = {
   CONFIG.SITE_URL = trim(CONFIG.SITE_URL).replace(/^https?:\/\//i, "").replace(/\/+$/, ""); }
 const siteUrl = () => CONFIG.SITE_URL || location.host || "ponsderby";
 const dur = sec => { sec = Math.max(0, Math.round(sec)); if (sec < 60) return sec + "s"; if (sec < 3600) return Math.floor(sec/60) + "m " + String(sec%60).padStart(2,"0") + "s"; return Math.floor(sec/3600) + "h " + String(Math.floor(sec%3600/60)).padStart(2,"0") + "m"; };
-const raceName = id => { const d = new Date(id*CONFIG.RACE_SEC*1000); return "the " + d.toLocaleTimeString([], {hour:"2-digit", minute:"2-digit", hour12:false}); };
-const raceShort = id => new Date(id*CONFIG.RACE_SEC*1000).toLocaleTimeString([], {hour:"2-digit", minute:"2-digit", hour12:false});
+// one formatter for every clock on the page: building a new one on each call is slow
+const HM = new Intl.DateTimeFormat([], {hour:"2-digit", minute:"2-digit", hour12:false});
+const raceName = id => "the " + clockTxt(id*CONFIG.RACE_SEC);
+const raceShort = id => clockTxt(id*CONFIG.RACE_SEC);
 
 /* ======================= state ======================= */
 const S = {
@@ -723,7 +725,7 @@ const fmt = (x, d = 2) => (x || 0).toFixed(d);
 const fmtTok = x => x >= 1e9 ? (x/1e9).toFixed(2)+"B" : x >= 1e6 ? (x/1e6).toFixed(2)+"M" : x >= 1e3 ? (x/1e3).toFixed(1)+"K" : Math.round(x).toString();
 const pctTxt = p => p >= 10 ? p.toFixed(0)+"%" : p >= 0.1 ? p.toFixed(2)+"%" : p > 0 ? "<0.1%" : "0%";
 function hash(str){let h=2166136261;for(const c of str){h^=c.charCodeAt(0);h=Math.imul(h,16777619)}return (h>>>0)/4294967295}
-function clockTxt(unix){return new Date(unix*1000).toLocaleTimeString([], {hour:"2-digit", minute:"2-digit", hour12:false})}
+function clockTxt(unix){return Number.isFinite(unix) ? HM.format(unix*1000) : "--:--"}
 function ago(sec){sec=Math.max(0,sec);if(sec<90)return Math.round(sec)+"s";if(sec<5400)return Math.round(sec/60)+"m";return (sec/3600).toFixed(1)+"h"}
 function esc(s){return String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]))}
 const median = a => { if(!a.length) return null; const b=[...a].sort((x,y)=>x-y); return b[Math.floor(b.length/2)]; };
@@ -1295,8 +1297,20 @@ function scan(){
 /* ======================= canvas: the racecourse ======================= */
 const cv = $("course"); let ctx = cv.getContext("2d");
 let W=0,H=0,DPR=1, crowd=[], trees=[], last=0, logDirty=true, bookTimer=0, labelSet=new Set();
+const PERF = {maxDpr:2, slow:0, frames:0, since:0, seen:true, hud:0};
+// the track is not drawn while it is scrolled out of sight
+if (window.IntersectionObserver) new IntersectionObserver(es => { PERF.seen = es[es.length-1].isIntersecting; }).observe(cv);
+function watchSpeed(nowMs, gap){
+  if (gap > 250){ PERF.frames = 0; PERF.since = nowMs; return; } // the tab was asleep
+  if (!PERF.since) PERF.since = nowMs;
+  PERF.frames++;
+  const span = nowMs - PERF.since; if (span < 2000) return;
+  PERF.slow = PERF.frames*1000/span < 34 ? PERF.slow + 1 : 0;
+  PERF.frames = 0; PERF.since = nowMs;
+  if (PERF.slow >= 3 && PERF.maxDpr > 1 && DPR > 1){ PERF.maxDpr = 1; resize(); }
+}
 function resize(){
-  DPR = Math.min(2, window.devicePixelRatio||1);
+  DPR = Math.min(PERF.maxDpr, window.devicePixelRatio||1);
   const r = cv.getBoundingClientRect(); W=r.width; H=r.height;
   cv.width = Math.round(W*DPR); cv.height = Math.round(H*DPR); ctx.setTransform(DPR,0,0,DPR,0,0);
   crowd = Array.from({length:Math.round(W/9)},(_,i)=>({x:i*9+hash("cx"+i)*6, h:hash("ch"+i), k:Math.floor(hash("ck"+i)*5)}));
@@ -1320,8 +1334,29 @@ function silksOf(s){
   return {a, b, p: Math.floor(h3*5), coat: COAT[Math.floor(hash(s.curve+"c")*COAT.length)]};
 }
 
+// scenery that never moves is painted once into two hidden canvases and copied on every frame
+const SCENE = {key:"", fonts:0, back:null, front:null};
+if (document.fonts){ const fresh = () => SCENE.fonts++; document.fonts.ready.then(fresh); document.fonts.addEventListener?.("loadingdone", fresh); }
+function paintLayer(old, paint, g){
+  const c = old || document.createElement("canvas"); c.width = cv.width; c.height = cv.height;
+  const main = ctx; ctx = c.getContext("2d");
+  try{ ctx.setTransform(DPR,0,0,DPR,0,0); paint(g); } finally { ctx = main; }
+  return c;
+}
 function drawBackdrop(now){
-  const g = G();
+  const g = G(), m = ctx.getTransform();
+  // while the camera is zoomed in, paint directly so that nothing blurs
+  const still = Math.abs(m.a - DPR) < 1e-6 && Math.abs(m.d - DPR) < 1e-6 && Math.abs(m.e) < 1e-6 && Math.abs(m.f) < 1e-6;
+  const key = `${cv.width}x${cv.height}:${W}x${H}:${SCENE.fonts}`;
+  if (still && SCENE.key !== key){ SCENE.back = paintLayer(SCENE.back, sceneBack, g); SCENE.front = paintLayer(SCENE.front, sceneFront, g); SCENE.key = key; }
+  if (still) ctx.drawImage(SCENE.back, 0, 0, W, H); else sceneBack(g);
+  drawGrandstandLive(now, g);
+  drawToteBoard(now, g);
+  if (still) ctx.drawImage(SCENE.front, 0, 0, W, H); else sceneFront(g);
+  // leave the pen as the runners expect it
+  ctx.textAlign = "center"; ctx.lineWidth = 3; ctx.font = "600 10px 'IBM Plex Mono', monospace";
+}
+function sceneBack(g){
   // sky and sun, poster style
   const sk = ctx.createLinearGradient(0,0,0,g.sky); sk.addColorStop(0,"#f1dcb8"); sk.addColorStop(1,"#efe6d2");
   ctx.fillStyle = sk; ctx.fillRect(0,0,W,g.far);
@@ -1332,8 +1367,9 @@ function drawBackdrop(now){
   ctx.fillStyle = "#3d6440";
   for (const t of trees){ ctx.beginPath(); ctx.arc(t.x, g.sky+4, t.r*0.9, Math.PI, 0); ctx.fill(); }
   ctx.fillRect(0, g.sky, W, g.far-g.sky+2);
-  drawGrandstand(now, g);
-  drawToteBoard(now, g);
+  drawGrandstand(g);
+}
+function sceneFront(g){
   // the track: mown turf in poster bands
   ctx.fillStyle = PAL.turf; ctx.fillRect(0, g.far, W, g.near - g.far);
   ctx.fillStyle = PAL.turf2; for (let x=-40; x<W; x+=64){ ctx.beginPath(); ctx.moveTo(x, g.far); ctx.lineTo(x+32, g.far); ctx.lineTo(x+52, g.near); ctx.lineTo(x+20, g.near); ctx.closePath(); ctx.fill(); }
@@ -1368,7 +1404,7 @@ function rail(y, a){
   ctx.fillStyle = `rgba(246,239,223,${a})`; ctx.fillRect(0, y-9, W, 3);
   for (let x=6; x<W; x+=26) ctx.fillRect(x, y-9, 2.5, 11);
 }
-function drawGrandstand(now, g){
+function drawGrandstand(g){
   const x0 = W*0.04, x1 = W*0.52, base = g.sky+2, top = g.sky*0.38;
   // stand body
   ctx.fillStyle = "#d9c9a6"; ctx.fillRect(x0, top+18, x1-x0, base-top-18);
@@ -1382,12 +1418,17 @@ function drawGrandstand(now, g){
   const n = 18; const w = (x1-x0+24)/n;
   for (let i=0;i<n;i++){ ctx.fillStyle = i%2 ? PAL.paper3 : PAL.red; ctx.beginPath(); ctx.moveTo(x0-12+i*w, top); ctx.lineTo(x0-12+(i+1)*w, top); ctx.lineTo(x0-12+(i+1)*w, top+18); ctx.quadraticCurveTo(x0-12+(i+.5)*w, top+26, x0-12+i*w, top+18); ctx.closePath(); ctx.fill(); }
   ctx.strokeStyle = PAL.ink; ctx.lineWidth = 1.2; ctx.strokeRect(x0-12, top, x1-x0+24, 18);
+  // the central pole
+  const px = (x0+x1)/2, pTop = top-58;
+  ctx.fillStyle = PAL.ink; ctx.fillRect(px-1.5, pTop, 3, top-pTop);
+}
+function drawGrandstandLive(now, g){
+  const x0 = W*0.04, x1 = W*0.52, top = g.sky*0.38;
   // bunting
   ctx.strokeStyle = "rgba(31,27,22,.5)"; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(x0-12, top-14); ctx.quadraticCurveTo((x0+x1)/2, top+2, x1+12, top-14); ctx.stroke();
   for (let i=1;i<24;i++){ const t = i/24, bx = x0-12 + t*(x1-x0+24), by = (1-t)*(1-t)*(top-14) + 2*(1-t)*t*(top+2) + t*t*(top-14); ctx.fillStyle = SILK[i%4===0?0:i%4===1?1:i%4===2?3:2]; ctx.beginPath(); ctx.moveTo(bx-5, by); ctx.lineTo(bx+5, by); ctx.lineTo(bx, by+9+Math.sin(now*3+i)*1.2); ctx.closePath(); ctx.fill(); }
   // the owner's flag on the central pole: raised by buys of the project token
   const px = (x0+x1)/2, pTop = top-58;
-  ctx.fillStyle = PAL.ink; ctx.fillRect(px-1.5, pTop, 3, top-pTop);
   const lit = !!S.lh.ship, act = lit ? lhActivity() : 0, raise = lit ? 0.35 + 0.65*act : 0.05;
   const fy = top - 10 - (top-10-pTop-4)*raise;
   ctx.fillStyle = lit ? PAL.red : "#9b9183";
@@ -1501,6 +1542,32 @@ function paceOf(s){
   const since = S.t - s.last;
   return since < 60 ? 1 : since < 300 ? 0.6 : since < 600 ? 0.35 : 0.2;
 }
+// Drawing a horse shape by shape on every frame is the slowest thing on the page. Each pose of the gallop
+// is therefore drawn once, kept as a small picture and copied from then on.
+const SPRITES = {map:new Map(), pixels:0, MAX:16e6, POSES:12};
+function horseSprite(s, x, y, L, pace, now, opts){
+  const m = ctx.getTransform();
+  // zoomed or tilted (camera shots, stumbles): draw directly so that nothing blurs
+  if (m.b || m.c || Math.abs(m.a - DPR) > 1e-6) return drawHorse(s, x, y, L, pace, now, opts);
+  const speed = 4 + pace*9, turn = Math.PI*2/SPRITES.POSES;
+  const pose = ((Math.floor((now*speed + s.phase*3)/turn) % SPRITES.POSES) + SPRITES.POSES) % SPRITES.POSES;
+  const sk = silksOf(s), size = Math.round(L*2)/2;
+  const key = [sk.coat, sk.a, sk.b, sk.p, s.num, s.devBurn>0, !!opts.headDown, !!opts.garland, !!opts.noJockey, size, pace, pose, DPR, SCENE.fonts].join("|");
+  const ox = size*1.1 + 4, oy = size*1.35 + 4;
+  let c = SPRITES.map.get(key);
+  if (!c){
+    c = document.createElement("canvas"); c.width = Math.ceil((ox*2)*DPR); c.height = Math.ceil((oy + size*0.25 + 4)*DPR);
+    const main = ctx; ctx = c.getContext("2d");
+    try{ ctx.setTransform(DPR,0,0,DPR,0,0); drawHorse(s, ox, oy, size, pace, (pose*turn - s.phase*3)/speed, Object.assign({}, opts, {alpha:null})); }
+    finally { ctx = main; }
+    SPRITES.map.set(key, c); SPRITES.pixels += c.width*c.height;
+    for (const [k, old] of SPRITES.map){ if (SPRITES.pixels <= SPRITES.MAX) break; SPRITES.map.delete(k); SPRITES.pixels -= old.width*old.height; }
+  }
+  const alpha = ctx.globalAlpha;
+  if (opts.alpha != null) ctx.globalAlpha = opts.alpha;
+  ctx.drawImage(c, Math.round((x - ox)*DPR)/DPR, Math.round((y - oy)*DPR)/DPR, c.width/DPR, c.height/DPR);
+  ctx.globalAlpha = alpha;
+}
 function drawRunner(s, now, g){
   const L = Math.max(22, Math.min(46, W/30)) * laneK(s.lane);
   let tx, y;
@@ -1533,7 +1600,7 @@ function drawRunner(s, now, g){
   if (s===S.selected){ ctx.strokeStyle = PAL.red; ctx.lineWidth = 2; ctx.setLineDash([4,3]); ctx.beginPath(); ctx.ellipse(x, y+1, L*0.7, L*0.15, 0, 0, 6.29); ctx.stroke(); ctx.setLineDash([]); }
   if (stum){ const a = (vt - stum.born)/1300; ctx.save(); ctx.translate(x + L*0.4, y); ctx.rotate(Math.sin(Math.PI*a)*0.32); ctx.translate(-(x + L*0.4), -y);
     ctx.fillStyle = `rgba(184,138,87,${0.6*(1-a)})`; for (let i=0;i<5;i++){ ctx.beginPath(); ctx.arc(x + L*0.4 + (i-2)*6, y - 2, 4 + a*10, 0, 6.29); ctx.fill(); } }
-  drawHorse(s, x, y, L, pace, now, {headDown: s.state==="sinking" || !!stum, garland: s.state==="graduated", alpha: s.state==="sinking" ? 0.7 : 1, noJockey: !!s.riderless});
+  horseSprite(s, x, y, L, pace, now, {headDown: s.state==="sinking" || !!stum, garland: s.state==="graduated", alpha: s.state==="sinking" ? 0.7 : 1, noJockey: !!s.riderless});
   if (stum) ctx.restore();
   if (s.devBurn > 0 && s.state!=="wreck") drawBurning(s, x, y, L, now);
   drawVetBadge(s, x, y, L);
@@ -1627,7 +1694,10 @@ function drawFx(nowMs, now, g){
 }
 
 function frame(nowMs){
-  const dt = Math.min(0.1, (nowMs - last)/1000); last = nowMs;
+  // fast screens (120 Hz and more) do not need every refresh
+  if (nowMs - last < 12){ requestAnimationFrame(frame); return; }
+  const gap = nowMs - last, dt = Math.min(0.1, gap/1000); last = nowMs;
+  if (PERF.seen) watchSpeed(nowMs, gap); else { PERF.frames = 0; PERF.since = 0; }
   if (S.mode==="replay"){
     if (S.speed > 0){ S.t += dt * S.speed; if (S.t > S.tEnd + 60){ seek(0); } advanceTo(S.t); }
     if (!scrubbing) $("scrub").value = Math.round(S.t);
@@ -1642,6 +1712,7 @@ function frame(nowMs){
   camUpdate(dt);
   VT += dt*1000*CAM.rate;
   const vms = VT, now = vms/1000, g = G();
+  if (PERF.seen){
   ctx.clearRect(0,0,W,H);
   ctx.save(); camApply();
   drawBackdrop(now);
@@ -1653,8 +1724,14 @@ function frame(nowMs){
   drawCrowd(now, g);
   ctx.restore();
   drawBroadcast();
+  }
   pumpCommentary(nowMs);
 
+  bookTimer += dt;
+  // the panels are rebuilt at most once a second, so buttons stay clickable
+  if (bookTimer > 1.5 || (logDirty && bookTimer > 1)){ renderBook(); bookTimer = 0; }
+  if (nowMs - PERF.hud < 250){ requestAnimationFrame(frame); return; }
+  PERF.hud = nowMs;
   const vis = S.ships.filter(s => s && s.t0 <= S.t);
   $("nRun").textContent = vis.filter(s=>s.state==="afloat"||s.state==="sinking").length;
   $("nWin").textContent = vis.filter(s=>s.state==="graduated").length;
@@ -1666,8 +1743,6 @@ function frame(nowMs){
   const going = v5 >= 5 ? "Firm" : v5 >= 2 ? "Good to firm" : v5 >= 0.6 ? "Good" : v5 >= 0.2 ? "Soft" : "Heavy";
   $("going").textContent = going; $("goingSub").textContent = `the going · ${fmt(v5,1)} ETH / 5 min`;
   $("clock").textContent = (S.mode==="replay" ? `Course time · ×${S.speed} · ` : "") + clockTxt(S.base + S.t);
-  bookTimer += dt;
-  if (logDirty || bookTimer > 1.5){ renderBook(); bookTimer = 0; }
   requestAnimationFrame(frame);
 }
 
